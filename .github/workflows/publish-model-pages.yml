@@ -52,7 +52,18 @@ jobs:
           # Tokenizer and model configuration files.
           download_file "added_tokens.json" "${TARGET}/added_tokens.json"
           download_file "config.json" "${TARGET}/config.json"
-          download_file "generation_config.json" "${TARGET}/generation_config.json"
+          # The converted repository has an incomplete Whisper generation_config.json
+          # that is missing multilingual language metadata. Use the official
+          # OpenAI Whisper Base generation config because the tokenizer IDs and
+          # architecture are the same, then force Arabic transcription in the app.
+          curl --fail --location \
+            --retry 20 \
+            --retry-all-errors \
+            --retry-delay 10 \
+            --connect-timeout 30 \
+            --max-time 3600 \
+            "https://huggingface.co/openai/whisper-base/resolve/main/generation_config.json?download=true" \
+            --output "${TARGET}/generation_config.json"
           download_file "merges.txt" "${TARGET}/merges.txt"
           download_file "normalizer.json" "${TARGET}/normalizer.json"
           download_file "preprocessor_config.json" "${TARGET}/preprocessor_config.json"
