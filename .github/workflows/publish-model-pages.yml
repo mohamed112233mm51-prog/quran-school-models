@@ -1,4 +1,4 @@
-name: Publish Quran streaming recognizer
+name: Publish Quran streaming recognizer v7.3
 
 on:
   workflow_dispatch:
@@ -135,11 +135,22 @@ jobs:
                   separators=(",", ":"),
               )
 
-          def segment_units(text: str, context: str) -> list[str]:
+          def segment_units_with_spans(
+              text: str,
+              context: str,
+          ) -> tuple[list[str], list[tuple[int, int]]]:
+              """Tokenize the full phoneme stream once and retain character offsets.
+
+              The model vocabulary contains multi-character phoneme units. Tokenizing every
+              word independently can split a unit differently at a word boundary, which was
+              the cause of the v7.2 failure. We therefore tokenize the complete ayah once,
+              then partition that one immutable token sequence among its words.
+              """
               text = text.strip()
               if not text:
-                  return []
+                  return [], []
               units: list[str] = []
+              spans: list[tuple[int, int]] = []
               pos = 0
               while pos < len(text):
                   matched = next((token for token in greedy_tokens if text.startswith(token, pos)), None)
@@ -148,9 +159,62 @@ jobs:
                       raise RuntimeError(
                           f"Unknown phoneme {text[pos]!r} ({codepoint}) in {context} at position {pos}"
                       )
+                  end = pos + len(matched)
                   units.append(matched)
-                  pos += len(matched)
-              return units
+                  spans.append((pos, end))
+                  pos = end
+              return units, spans
+
+          def nearest_monotonic_token_boundaries(
+              desired_char_starts: list[int],
+              token_spans: list[tuple[int, int]],
+              context: str,
+          ) -> list[int]:
+              """Map word starts in phoneme-character space to safe token boundaries.
+
+              Each word receives at least one model token. A multi-character model token that
+              crosses a linguistic word boundary is assigned wholly to the nearest side; it is
+              never split or duplicated. Consequently, concatenating all word token lists is
+              guaranteed to reproduce the model's full canonical token sequence exactly.
+              """
+              word_count = len(desired_char_starts)
+              token_count = len(token_spans)
+              if word_count == 0:
+                  return [0]
+              if token_count < word_count:
+                  raise RuntimeError(
+                      f"Only {token_count} model tokens for {word_count} Quran words in {context}"
+                  )
+
+              # Boundary i means the position immediately before model token i.
+              token_char_boundaries = [0] + [end for _, end in token_spans]
+              boundaries = [0]
+
+              for word_index in range(1, word_count):
+                  desired = desired_char_starts[word_index]
+                  minimum = boundaries[-1] + 1
+                  remaining_words = word_count - word_index
+                  maximum = token_count - remaining_words
+                  if minimum > maximum:
+                      raise RuntimeError(
+                          f"Cannot reserve one token per remaining word in {context}: "
+                          f"min={minimum}, max={maximum}"
+                      )
+
+                  # Pick the closest legal whole-token boundary. When distances tie, prefer
+                  # the boundary after the desired position so a cross-boundary unit stays
+                  # with the word that acoustically began it.
+                  boundary = min(
+                      range(minimum, maximum + 1),
+                      key=lambda index: (
+                          abs(token_char_boundaries[index] - desired),
+                          0 if token_char_boundaries[index] >= desired else 1,
+                      ),
+                  )
+                  boundaries.append(boundary)
+
+              boundaries.append(token_count)
+              return boundaries
 
           def mapping_span(mapping: Any) -> tuple[int, int] | None:
               if mapping is None or bool(getattr(mapping, "deleted", False)):
@@ -230,27 +294,44 @@ jobs:
                       if any(starts[index] >= starts[index + 1] for index in range(len(starts) - 1)):
                           raise RuntimeError(f"Non-increasing phoneme starts: {starts}")
 
+                      full_units, full_token_spans = segment_units_with_spans(
+                          phoneme_text,
+                          f"ayah {key}",
+                      )
+                      token_boundaries = nearest_monotonic_token_boundaries(
+                          starts,
+                          full_token_spans,
+                          f"ayah {key}",
+                      )
+                      token_char_boundaries = [0] + [end for _, end in full_token_spans]
+
                       word_rows: list[dict[str, Any]] = []
                       concatenated: list[str] = []
                       for index, word in enumerate(words):
-                          ph_start = starts[index]
-                          ph_end = starts[index + 1] if index + 1 < len(starts) else len(phoneme_text)
-                          if ph_end <= ph_start:
-                              raise RuntimeError(f"Empty phoneme span for word {index + 1}")
-                          units = segment_units(phoneme_text[ph_start:ph_end], f"ayah {key}, word {index + 1}")
+                          token_start = token_boundaries[index]
+                          token_end = token_boundaries[index + 1]
+                          units = full_units[token_start:token_end]
                           if not units:
-                              raise RuntimeError(f"No units for word {index + 1}")
+                              raise RuntimeError(f"No model units for word {index + 1}")
+
+                          ph_start = token_char_boundaries[token_start]
+                          ph_end = token_char_boundaries[token_end]
                           word_rows.append({
                               "text": word,
                               "phonemes": units,
                               "phoneme_start": ph_start,
                               "phoneme_end": ph_end,
+                              "token_start": token_start,
+                              "token_end": token_end,
+                              "mapped_start": starts[index],
+                              "boundary_shift": ph_start - starts[index],
                           })
                           concatenated.extend(units)
 
-                      full_units = segment_units(phoneme_text, f"ayah {key}")
+                      # This is now a structural invariant, not a best-effort comparison:
+                      # every full-stream token is assigned exactly once to one Quran word.
                       if concatenated != full_units:
-                          raise RuntimeError("Word spans do not reproduce the full canonical phoneme stream")
+                          raise RuntimeError("Internal token partition invariant failed")
 
                       ayahs[key] = {
                           "surah": surah,
@@ -276,8 +357,9 @@ jobs:
           with (OUT / "quran-word-phonemes.json").open("w", encoding="utf-8") as handle:
               json.dump(
                   {
-                      "version": 2,
+                      "version": 3,
                       "source": "obadx/quran-transcript + Muno459/zipformer_p-quran",
+                      "boundary_method": "whole-ayah tokenization with nearest monotonic whole-token word boundaries",
                       "moshaf": {
                           "rewaya": "hafs",
                           "madd_monfasel_len": 4,
