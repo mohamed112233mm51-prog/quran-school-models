@@ -1,0 +1,673 @@
+name: Publish Quran streaming recognizer v7.3.1
+run-name: Quran streaming v7.3.1 • run ${{ github.run_number }}
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: quran-streaming-pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow version
+        run: |
+          echo "WORKFLOW_VERSION=7.3.1_WHOLE_AYAH_TOKEN_PARTITION"
+          echo "This workflow does not contain the old v7.2 word-span comparison."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install model and Quran phonetic tooling
+        run: |
+          python -m pip install --upgrade huggingface_hub
+          python -m pip install "git+https://github.com/obadx/quran-transcript.git@main"
+
+      - name: Verify HF token exists
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::error::Add a repository secret named HF_TOKEN after accepting the model terms on Hugging Face."
+            exit 1
+          fi
+
+      - name: Download gated Quran streaming model
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
+
+          repo = "Muno459/zipformer_p-quran"
+          files = [
+              "quran_phoneme_zipformer.int8.onnx",
+              "phoneme_units.json",
+              "tokens.txt",
+              "quran_text2phoneme.json",
+              "ordered_quran_phonemes.json",
+              "LICENSE",
+              "README.md",
+          ]
+          os.makedirs("downloaded-model", exist_ok=True)
+          for filename in files:
+              print(f"Downloading {filename} ...", flush=True)
+              path = hf_hub_download(
+                  repo_id=repo,
+                  filename=filename,
+                  token=os.environ["HF_TOKEN"],
+                  local_dir="downloaded-model",
+              )
+              print(path, flush=True)
+          PY
+
+      - name: Generate sherpa tokens and reliable word-level Quran data
+        run: |
+          cat > /tmp/prepare_quran_assets.py <<'PY'
+          import json
+          import re
+          import shutil
+          from pathlib import Path
+          from typing import Any
+
+          from quran_transcript import Aya, MoshafAttributes, quran_phonetizer
+
+          ROOT = Path("downloaded-model")
+          OUT = Path("prepared-assets")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          def read_tokens(path: Path) -> dict[str, int]:
+              result: dict[str, int] = {}
+              for raw_line in path.read_text(encoding="utf-8").splitlines():
+                  line = raw_line.strip()
+                  if not line:
+                      continue
+                  token, token_id = line.rsplit(maxsplit=1)
+                  result[token] = int(token_id)
+              if not result:
+                  raise RuntimeError("tokens.txt is empty")
+              if len(result.values()) != len(set(result.values())):
+                  raise RuntimeError("Duplicate ids found in tokens.txt")
+              return result
+
+          vocab = read_tokens(ROOT / "tokens.txt")
+          blank_id = vocab.get("<blk>", max(vocab.values()))
+          shutil.copy2(ROOT / "tokens.txt", OUT / "tokens.txt")
+
+          special_tokens = {"<blk>", "<eps>", "<unk>", "<s>", "</s>", "<pad>"}
+          greedy_tokens = sorted(
+              [
+                  token
+                  for token in vocab
+                  if token
+                  and token not in special_tokens
+                  and not (token.startswith("<") and token.endswith(">"))
+              ],
+              key=len,
+              reverse=True,
+          )
+
+          with (OUT / "phoneme-vocabulary.json").open("w", encoding="utf-8") as handle:
+              json.dump(
+                  {
+                      "version": 2,
+                      "blank_id": blank_id,
+                      "tokens": [
+                          token
+                          for token, _ in sorted(vocab.items(), key=lambda item: item[1])
+                          if token != "<blk>"
+                      ],
+                  },
+                  handle,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              )
+
+          def segment_units_with_spans(
+              text: str,
+              context: str,
+          ) -> tuple[list[str], list[tuple[int, int]]]:
+              """Tokenize the full phoneme stream once and retain character offsets.
+
+              The model vocabulary contains multi-character phoneme units. Tokenizing every
+              word independently can split a unit differently at a word boundary, which was
+              the cause of the v7.2 failure. We therefore tokenize the complete ayah once,
+              then partition that one immutable token sequence among its words.
+              """
+              text = text.strip()
+              if not text:
+                  return [], []
+              units: list[str] = []
+              spans: list[tuple[int, int]] = []
+              pos = 0
+              while pos < len(text):
+                  matched = next((token for token in greedy_tokens if text.startswith(token, pos)), None)
+                  if matched is None:
+                      codepoint = f"U+{ord(text[pos]):04X}"
+                      raise RuntimeError(
+                          f"Unknown phoneme {text[pos]!r} ({codepoint}) in {context} at position {pos}"
+                      )
+                  end = pos + len(matched)
+                  units.append(matched)
+                  spans.append((pos, end))
+                  pos = end
+              return units, spans
+
+          def nearest_monotonic_token_boundaries(
+              desired_char_starts: list[int],
+              token_spans: list[tuple[int, int]],
+              context: str,
+          ) -> list[int]:
+              """Map word starts in phoneme-character space to safe token boundaries.
+
+              Each word receives at least one model token. A multi-character model token that
+              crosses a linguistic word boundary is assigned wholly to the nearest side; it is
+              never split or duplicated. Consequently, concatenating all word token lists is
+              guaranteed to reproduce the model's full canonical token sequence exactly.
+              """
+              word_count = len(desired_char_starts)
+              token_count = len(token_spans)
+              if word_count == 0:
+                  return [0]
+              if token_count < word_count:
+                  raise RuntimeError(
+                      f"Only {token_count} model tokens for {word_count} Quran words in {context}"
+                  )
+
+              # Boundary i means the position immediately before model token i.
+              token_char_boundaries = [0] + [end for _, end in token_spans]
+              boundaries = [0]
+
+              for word_index in range(1, word_count):
+                  desired = desired_char_starts[word_index]
+                  minimum = boundaries[-1] + 1
+                  remaining_words = word_count - word_index
+                  maximum = token_count - remaining_words
+                  if minimum > maximum:
+                      raise RuntimeError(
+                          f"Cannot reserve one token per remaining word in {context}: "
+                          f"min={minimum}, max={maximum}"
+                      )
+
+                  # Pick the closest legal whole-token boundary. When distances tie, prefer
+                  # the boundary after the desired position so a cross-boundary unit stays
+                  # with the word that acoustically began it.
+                  boundary = min(
+                      range(minimum, maximum + 1),
+                      key=lambda index: (
+                          abs(token_char_boundaries[index] - desired),
+                          0 if token_char_boundaries[index] >= desired else 1,
+                      ),
+                  )
+                  boundaries.append(boundary)
+
+              boundaries.append(token_count)
+              return boundaries
+
+          def mapping_span(mapping: Any) -> tuple[int, int] | None:
+              if mapping is None or bool(getattr(mapping, "deleted", False)):
+                  return None
+              pos = getattr(mapping, "pos", None)
+              if not pos or len(pos) != 2:
+                  return None
+              start, end = int(pos[0]), int(pos[1])
+              if end <= start:
+                  return None
+              return start, end
+
+          def find_word_char_spans(text: str, words: list[str]) -> list[tuple[int, int]]:
+              spans: list[tuple[int, int]] = []
+              cursor = 0
+              for word in words:
+                  start = text.find(word, cursor)
+                  if start < 0:
+                      raise RuntimeError(f"Could not locate word {word!r} inside ayah text {text!r}")
+                  end = start + len(word)
+                  spans.append((start, end))
+                  cursor = end
+              return spans
+
+          moshaf = MoshafAttributes(
+              rewaya="hafs",
+              madd_monfasel_len=4,
+              madd_mottasel_len=4,
+              madd_mottasel_waqf=4,
+              madd_aared_len=4,
+          )
+
+          ayahs: dict[str, Any] = {}
+          failures: list[str] = []
+
+          quran_cursor = Aya(1, 1)
+          for surah in range(1, 115):
+              quran_cursor.set(surah, 1)
+              first_info = quran_cursor.get()
+              count = int(first_info.num_ayat_in_sura)
+
+              for ayah in range(1, count + 1):
+                  key = f"{surah}:{ayah}"
+                  try:
+                      quran_cursor.set(surah, ayah)
+                      info = quran_cursor.get()
+                      text = str(info.uthmani).strip()
+                      words = [str(word) for word in info.uthmani_words if str(word).strip()]
+                      if not text or not words:
+                          raise RuntimeError("Empty Uthmani text or word list")
+
+                      # Generate the full ayah in connected-recitation mode. Removing spaces keeps
+                      # the canonical reference in the same compact phoneme stream used by the CTC model.
+                      phonetic = quran_phonetizer(text, moshaf, remove_spaces=True)
+                      phoneme_text = str(phonetic.phonemes)
+                      mappings = list(phonetic.mappings)
+                      if len(mappings) != len(text):
+                          raise RuntimeError(
+                              f"Mapping length mismatch: text={len(text)}, mappings={len(mappings)}"
+                          )
+
+                      char_spans = find_word_char_spans(text, words)
+                      starts: list[int] = []
+                      for word_index, (char_start, char_end) in enumerate(char_spans):
+                          mapped = [
+                              span
+                              for span in (mapping_span(mappings[index]) for index in range(char_start, char_end))
+                              if span is not None
+                          ]
+                          if not mapped:
+                              raise RuntimeError(f"Word {word_index + 1} has no mapped phonemes")
+                          starts.append(min(span[0] for span in mapped))
+
+                      # The first word owns any leading context; inter-word transformed sounds are
+                      # assigned up to the next word's mapped start. This covers the full stream once.
+                      starts[0] = 0
+                      if any(starts[index] >= starts[index + 1] for index in range(len(starts) - 1)):
+                          raise RuntimeError(f"Non-increasing phoneme starts: {starts}")
+
+                      full_units, full_token_spans = segment_units_with_spans(
+                          phoneme_text,
+                          f"ayah {key}",
+                      )
+                      token_boundaries = nearest_monotonic_token_boundaries(
+                          starts,
+                          full_token_spans,
+                          f"ayah {key}",
+                      )
+                      token_char_boundaries = [0] + [end for _, end in full_token_spans]
+
+                      word_rows: list[dict[str, Any]] = []
+                      concatenated: list[str] = []
+                      for index, word in enumerate(words):
+                          token_start = token_boundaries[index]
+                          token_end = token_boundaries[index + 1]
+                          units = full_units[token_start:token_end]
+                          if not units:
+                              raise RuntimeError(f"No model units for word {index + 1}")
+
+                          ph_start = token_char_boundaries[token_start]
+                          ph_end = token_char_boundaries[token_end]
+                          word_rows.append({
+                              "text": word,
+                              "phonemes": units,
+                              "phoneme_start": ph_start,
+                              "phoneme_end": ph_end,
+                              "token_start": token_start,
+                              "token_end": token_end,
+                              "mapped_start": starts[index],
+                              "boundary_shift": ph_start - starts[index],
+                          })
+                          concatenated.extend(units)
+
+                      # This is now a structural invariant, not a best-effort comparison:
+                      # every full-stream token is assigned exactly once to one Quran word.
+                      if concatenated != full_units:
+                          raise RuntimeError("Internal token partition invariant failed")
+
+                      ayahs[key] = {
+                          "surah": surah,
+                          "ayah": ayah,
+                          "text": text,
+                          "phonemes": full_units,
+                          "words": word_rows,
+                      }
+                  except Exception as error:
+                      if len(failures) < 20:
+                          failures.append(f"{key}: {error}")
+
+          if failures:
+              print("First generation failures:")
+              print("\n".join(failures))
+
+          if len(ayahs) != 6236:
+              raise RuntimeError(
+                  f"Generated {len(ayahs)} of 6236 ayahs. "
+                  "The workflow stops rather than publishing unreliable word colors."
+              )
+
+          with (OUT / "quran-word-phonemes.json").open("w", encoding="utf-8") as handle:
+              json.dump(
+                  {
+                      "version": 3,
+                      "source": "obadx/quran-transcript + Muno459/zipformer_p-quran",
+                      "boundary_method": "whole-ayah tokenization with nearest monotonic whole-token word boundaries",
+                      "moshaf": {
+                          "rewaya": "hafs",
+                          "madd_monfasel_len": 4,
+                          "madd_mottasel_len": 4,
+                          "madd_mottasel_waqf": 4,
+                          "madd_aared_len": 4,
+                      },
+                      "ayahs": ayahs,
+                  },
+                  handle,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              )
+
+          for filename in ("LICENSE", "README.md"):
+              target_name = "MODEL_LICENSE.txt" if filename == "LICENSE" else filename
+              shutil.copy2(ROOT / filename, OUT / target_name)
+
+          print(f"Prepared all {len(ayahs)} ayahs with reliable word boundaries")
+          print(f"Vocabulary size: {len(vocab)}, blank id: {blank_id}")
+          PY
+          python /tmp/prepare_quran_assets.py
+
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: '4.0.23'
+          actions-cache-folder: emsdk-cache
+
+      - name: Build sherpa-onnx WebAssembly streaming runtime
+        run: |
+          git clone --depth 1 --branch v1.13.2 https://github.com/k2-fsa/sherpa-onnx.git sherpa-onnx
+          cp downloaded-model/quran_phoneme_zipformer.int8.onnx sherpa-onnx/wasm/asr/assets/encoder.onnx
+          cp prepared-assets/tokens.txt sherpa-onnx/wasm/asr/assets/tokens.txt
+
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("sherpa-onnx/wasm/asr/sherpa-onnx-asr.js")
+          text = path.read_text(encoding="utf-8")
+          old = "let type = 0;"
+          if old not in text:
+              raise RuntimeError("Could not locate the sherpa model type selector")
+          path.write_text(text.replace(old, "let type = 2;", 1), encoding="utf-8")
+          PY
+
+          cd sherpa-onnx
+          ./build-wasm-simd-asr.sh
+          cd ..
+
+      - name: Assemble browser runtime
+        run: |
+          mkdir -p site/streaming
+          OUT_DIR="sherpa-onnx/build-wasm-simd-asr/install/bin/wasm/asr"
+          cp "$OUT_DIR"/* site/streaming/
+          cp prepared-assets/quran-word-phonemes.json site/streaming/
+          cp prepared-assets/phoneme-vocabulary.json site/streaming/
+          cp prepared-assets/MODEL_LICENSE.txt site/streaming/
+          cp prepared-assets/README.md site/streaming/MODEL_README.md
+
+          cat > site/streaming/quran-streaming-host.js <<'JS'
+          (() => {
+            'use strict'
+
+            let moduleRef = null
+            let recognizer = null
+            let stream = null
+            let ready = false
+            let lastText = ''
+            let canonicalPromise = null
+            let vocabularyPromise = null
+
+            const reply = (event, payload, transfer = []) => {
+              if (!event.source || typeof event.source.postMessage !== 'function') return
+              event.source.postMessage({ ...payload, __quranStreaming: true }, event.origin || '*', transfer)
+            }
+
+            const loadJson = async (name) => {
+              const response = await fetch(new URL(name, location.href), { cache: 'force-cache' })
+              if (!response.ok) throw new Error(`Failed to load ${name}: ${response.status}`)
+              return response.json()
+            }
+
+            const getCanonicalStore = () => {
+              canonicalPromise ||= loadJson('quran-word-phonemes.json')
+              return canonicalPromise
+            }
+
+            const getVocabularyStore = () => {
+              vocabularyPromise ||= loadJson('phoneme-vocabulary.json')
+              return vocabularyPromise
+            }
+
+            const recognizerConfig = () => ({
+              featConfig: { sampleRate: 16000, featureDim: 80 },
+              modelConfig: {
+                transducer: { encoder: '', decoder: '', joiner: '' },
+                paraformer: { encoder: '', decoder: '' },
+                zipformer2Ctc: { model: './encoder.onnx' },
+                nemoCtc: { model: '' },
+                toneCtc: { model: '' },
+                tokens: './tokens.txt',
+                numThreads: 1,
+                provider: 'cpu',
+                debug: 0,
+                modelType: 'zipformer2',
+                modelingUnit: 'cjkchar',
+                bpeVocab: '',
+              },
+              decodingMethod: 'greedy_search',
+              maxActivePaths: 4,
+              enableEndpoint: 0,
+              rule1MinTrailingSilence: 2.4,
+              rule2MinTrailingSilence: 1.2,
+              rule3MinUtteranceLength: 20,
+              hotwordsFile: '',
+              hotwordsScore: 1.5,
+              ctcFstDecoderConfig: { graph: '', maxActive: 3000 },
+              ruleFsts: '',
+              ruleFars: '',
+            })
+
+            const ensureStream = () => {
+              if (!ready || !recognizer) throw new Error('Streaming model is not ready')
+              if (!stream) stream = recognizer.createStream()
+              return stream
+            }
+
+            const normalizeResult = (result) => ({
+              text: typeof result?.text === 'string' ? result.text : '',
+              tokens: Array.isArray(result?.tokens) ? result.tokens.map(String) : [],
+              timestamps: Array.isArray(result?.timestamps) ? result.timestamps : [],
+            })
+
+            const decodeAvailable = (targetStream) => {
+              let loops = 0
+              while (recognizer.isReady(targetStream) && loops < 80) {
+                recognizer.decode(targetStream)
+                loops += 1
+              }
+              return normalizeResult(recognizer.getResult(targetStream))
+            }
+
+            const emitPartial = (event, result, final = false) => {
+              const signature = `${result.text}\u0000${result.tokens.join('\u0001')}`
+              if (!final && signature === lastText) return
+              lastText = signature
+              reply(event, {
+                type: final ? 'quran-streaming-final' : 'quran-streaming-partial',
+                result,
+              })
+            }
+
+            const resetStream = () => {
+              if (stream) {
+                try { stream.free() } catch (_) { /* no-op */ }
+              }
+              stream = recognizer?.createStream() || null
+              lastText = ''
+            }
+
+            window.QuranStreamingHost = {
+              onRuntimeReady(Module) {
+                try {
+                  moduleRef = Module
+                  recognizer = createOnlineRecognizer(moduleRef, recognizerConfig())
+                  ready = true
+                  window.parent?.postMessage({ type: 'quran-streaming-ready', __quranStreaming: true }, '*')
+                } catch (error) {
+                  console.error(error)
+                  window.parent?.postMessage({
+                    type: 'quran-streaming-error',
+                    __quranStreaming: true,
+                    message: error instanceof Error ? error.message : String(error),
+                  }, '*')
+                }
+              },
+            }
+
+            window.addEventListener('message', async (event) => {
+              const message = event.data
+              if (!message || message.__quranStreamingClient !== true) return
+              const requestId = message.requestId
+              try {
+                switch (message.type) {
+                  case 'ping':
+                    reply(event, { type: 'response', requestId, ok: true, value: { ready } })
+                    break
+                  case 'start':
+                    resetStream()
+                    reply(event, { type: 'response', requestId, ok: true, value: true })
+                    break
+                  case 'audio': {
+                    const targetStream = ensureStream()
+                    const samples = message.samples instanceof Float32Array
+                      ? message.samples
+                      : new Float32Array(message.samples)
+                    targetStream.acceptWaveform(16000, samples)
+                    const result = decodeAvailable(targetStream)
+                    emitPartial(event, result, false)
+                    break
+                  }
+                  case 'finish': {
+                    const targetStream = ensureStream()
+                    // A small zero tail lets the streaming graph flush its final chunk.
+                    targetStream.acceptWaveform(16000, new Float32Array(8000))
+                    targetStream.inputFinished()
+                    const result = decodeAvailable(targetStream)
+                    emitPartial(event, result, true)
+                    reply(event, { type: 'response', requestId, ok: true, value: result })
+                    break
+                  }
+                  case 'reset':
+                    resetStream()
+                    reply(event, { type: 'response', requestId, ok: true, value: true })
+                    break
+                  case 'canonical': {
+                    const store = await getCanonicalStore()
+                    const key = `${Number(message.surah)}:${Number(message.ayah)}`
+                    const value = store?.ayahs?.[key] || null
+                    if (!value) throw new Error(`Canonical phonemes not found for ${key}`)
+                    reply(event, { type: 'response', requestId, ok: true, value })
+                    break
+                  }
+                  case 'vocabulary': {
+                    const value = await getVocabularyStore()
+                    reply(event, { type: 'response', requestId, ok: true, value })
+                    break
+                  }
+                  default:
+                    throw new Error(`Unknown streaming request: ${message.type}`)
+                }
+              } catch (error) {
+                reply(event, {
+                  type: 'response',
+                  requestId,
+                  ok: false,
+                  error: error instanceof Error ? error.message : String(error),
+                })
+              }
+            })
+          })()
+          JS
+
+          python - <<'PY'
+          from pathlib import Path
+          import glob
+
+          root = Path("site/streaming")
+          wrappers = [p for p in root.glob("*.js") if p.name in {"sherpa-onnx.js", "sherpa-onnx-asr.js"}]
+          mains = [p for p in root.glob("*.js") if "wasm" in p.name and "main" in p.name]
+          if not wrappers or not mains:
+              raise RuntimeError(f"Could not locate sherpa browser scripts. Found: {[p.name for p in root.glob('*')]}")
+          wrapper = wrappers[0].name
+          main = mains[0].name
+          html = f'''<!doctype html>
+          <html lang="ar" dir="rtl">
+          <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <title>Quran Streaming Recognizer</title>
+          </head>
+          <body>
+            <p id="status">جارٍ تجهيز نموذج التسميع اللحظي…</p>
+            <script src="./quran-streaming-host.js"></script>
+            <script src="./{wrapper}"></script>
+            <script>
+              var Module = {{
+                locateFile: function(path) {{ return new URL(path, location.href).href; }},
+                onRuntimeInitialized: function() {{
+                  document.getElementById('status').textContent = 'النموذج جاهز';
+                  window.QuranStreamingHost.onRuntimeReady(Module);
+                }},
+                print: function(text) {{ console.log(text); }},
+                printErr: function(text) {{ console.error(text); }}
+              }};
+            </script>
+            <script src="./{main}"></script>
+          </body>
+          </html>'''
+          (root / "index.html").write_text(html, encoding="utf-8")
+          (root / "runtime-manifest.json").write_text(
+              '{"version":1,"engine":"sherpa-onnx","model":"Muno459/zipformer_p-quran-int8","mode":"streaming-phoneme-ctc"}',
+              encoding="utf-8",
+          )
+          PY
+
+          cat > site/index.html <<'HTML'
+          <!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><title>Quran School Models</title><body><h1>نماذج مدرسة القرآن</h1><p><a href="./streaming/">فتح محرك التسميع اللحظي</a></p><p>الاستخدام مجاني وغير تجاري فقط وفق ترخيص النموذج المنشور داخل المجلد.</p></body></html>
+          HTML
+
+          du -sh site
+          find site/streaming -maxdepth 1 -type f -printf '%f %k KB\n' | sort
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
