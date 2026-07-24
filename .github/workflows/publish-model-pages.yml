@@ -1,4 +1,4 @@
-name: Publish Quran model to GitHub Pages
+name: Publish Quran streaming recognizer
 
 on:
   workflow_dispatch:
@@ -9,12 +9,13 @@ permissions:
   id-token: write
 
 concurrency:
-  group: github-pages
+  group: quran-streaming-pages
   cancel-in-progress: false
 
 jobs:
-  build-and-deploy:
+  build-and-publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -23,78 +24,594 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare model files
-        shell: bash
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Hugging Face downloader
+        run: python -m pip install --upgrade huggingface_hub
+
+      - name: Verify HF token exists
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          set -euo pipefail
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::error::Add a repository secret named HF_TOKEN after accepting the model terms on Hugging Face."
+            exit 1
+          fi
 
-          REVISION="86aa2ae915f3b11c60b4c031774a7b5123477ba5"
-          MODEL_ID="eventhorizon0/tarteel-ai-onnx-whisper-base-ar-quran"
-          SOURCE="https://huggingface.co/${MODEL_ID}/resolve/${REVISION}"
-          TARGET="site/${MODEL_ID}/resolve/${REVISION}"
+      - name: Download gated Quran streaming model
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
 
-          mkdir -p "${TARGET}/onnx"
+          repo = "Muno459/zipformer_p-quran"
+          files = [
+              "quran_phoneme_zipformer.int8.onnx",
+              "phoneme_units.json",
+              "quran_text2phoneme.json",
+              "ordered_quran_phonemes.json",
+              "LICENSE",
+              "README.md",
+          ]
+          os.makedirs("downloaded-model", exist_ok=True)
+          for filename in files:
+              print(f"Downloading {filename} ...", flush=True)
+              path = hf_hub_download(
+                  repo_id=repo,
+                  filename=filename,
+                  token=os.environ["HF_TOKEN"],
+                  local_dir="downloaded-model",
+              )
+              print(path, flush=True)
+          PY
 
-          download_file() {
-            local remote_path="$1"
-            local local_path="$2"
-            echo "Downloading ${remote_path}"
-            curl --fail --location \
-              --retry 20 \
-              --retry-all-errors \
-              --retry-delay 10 \
-              --connect-timeout 30 \
-              --max-time 3600 \
-              "${SOURCE}/${remote_path}?download=true" \
-              --output "${local_path}"
-          }
+      - name: Generate sherpa tokens and normalized word-level Quran data
+        run: |
+          cat > /tmp/prepare_quran_assets.py <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          from typing import Any
 
-          # Tokenizer and model configuration files.
-          download_file "added_tokens.json" "${TARGET}/added_tokens.json"
-          download_file "config.json" "${TARGET}/config.json"
-          # The converted repository has an incomplete Whisper generation_config.json
-          # that is missing multilingual language metadata. Use the official
-          # OpenAI Whisper Base generation config because the tokenizer IDs and
-          # architecture are the same, then force Arabic transcription in the app.
-          curl --fail --location \
-            --retry 20 \
-            --retry-all-errors \
-            --retry-delay 10 \
-            --connect-timeout 30 \
-            --max-time 3600 \
-            "https://huggingface.co/openai/whisper-base/resolve/main/generation_config.json?download=true" \
-            --output "${TARGET}/generation_config.json"
-          download_file "merges.txt" "${TARGET}/merges.txt"
-          download_file "normalizer.json" "${TARGET}/normalizer.json"
-          download_file "preprocessor_config.json" "${TARGET}/preprocessor_config.json"
-          download_file "special_tokens_map.json" "${TARGET}/special_tokens_map.json"
-          download_file "tokenizer.json" "${TARGET}/tokenizer.json"
-          download_file "tokenizer_config.json" "${TARGET}/tokenizer_config.json"
-          download_file "vocab.json" "${TARGET}/vocab.json"
+          ROOT = Path("downloaded-model")
+          OUT = Path("prepared-assets")
+          OUT.mkdir(parents=True, exist_ok=True)
 
-          # Browser-friendly Q4 ONNX files used by the application.
-          download_file "onnx/config.json" "${TARGET}/onnx/config.json"
-          download_file "onnx/encoder_model_q4.onnx" "${TARGET}/onnx/encoder_model_q4.onnx"
-          download_file "onnx/decoder_model_merged_q4.onnx" "${TARGET}/onnx/decoder_model_merged_q4.onnx"
+          def load_json(name: str) -> Any:
+              with (ROOT / name).open("r", encoding="utf-8") as handle:
+                  return json.load(handle)
+
+          def token_map(data: Any) -> dict[str, int]:
+              candidates = data
+              if isinstance(data, dict):
+                  for key in ("token_to_id", "piece_to_id", "vocab", "units", "pieces", "tokens"):
+                      if key in data:
+                          candidates = data[key]
+                          break
+
+              result: dict[str, int] = {}
+              if isinstance(candidates, list):
+                  for index, item in enumerate(candidates):
+                      if isinstance(item, str):
+                          result[item] = index
+                      elif isinstance(item, dict):
+                          token = item.get("token") or item.get("piece") or item.get("unit") or item.get("text")
+                          token_id = item.get("id", index)
+                          if token is not None:
+                              result[str(token)] = int(token_id)
+              elif isinstance(candidates, dict):
+                  for key, value in candidates.items():
+                      if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
+                          result[str(key)] = int(value)
+                      elif (isinstance(key, str) and key.isdigit()) and isinstance(value, str):
+                          result[value] = int(key)
+                      elif isinstance(value, dict):
+                          token = value.get("token") or value.get("piece") or value.get("unit") or value.get("text") or key
+                          token_id = value.get("id")
+                          if token_id is not None:
+                              result[str(token)] = int(token_id)
+
+              if not result:
+                  raise RuntimeError("Could not understand phoneme_units.json structure")
+              ids = sorted(result.values())
+              if len(ids) != len(set(ids)):
+                  raise RuntimeError("Duplicate ids found in phoneme_units.json")
+              return result
+
+          vocab = token_map(load_json("phoneme_units.json"))
+          blank_id = max(vocab.values()) + 1
+          with (OUT / "tokens.txt").open("w", encoding="utf-8") as handle:
+              for token, token_id in sorted(vocab.items(), key=lambda item: item[1]):
+                  display = token if token else "<eps>"
+                  handle.write(f"{display} {token_id}\n")
+              handle.write(f"<blk> {blank_id}\n")
+
+          # Stable vocabulary file for the browser-side greedy segmenter.
+          with (OUT / "phoneme-vocabulary.json").open("w", encoding="utf-8") as handle:
+              json.dump(
+                  {
+                      "version": 1,
+                      "blank_id": blank_id,
+                      "tokens": [token for token, _ in sorted(vocab.items(), key=lambda item: item[1])],
+                  },
+                  handle,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              )
+
+          ordered = load_json("ordered_quran_phonemes.json")
+          text_to_phoneme = load_json("quran_text2phoneme.json")
+          arabic_word_re = re.compile(r"[\u0621-\u063A\u0641-\u064A\u0671\u064B-\u065F\u0670\u06D6-\u06ED]+")
+          arabic_base_re = re.compile(r"[\u0621-\u063A\u0641-\u064A\u0671]")
+          special_tokens = {"<blk>", "<eps>", "<unk>", "<s>", "</s>", "<pad>"}
+          greedy_tokens = sorted(
+              [t for t in vocab if t and t not in special_tokens and not (t.startswith("<") and t.endswith(">"))],
+              key=len,
+              reverse=True,
+          )
+
+          def segment_units(value: Any) -> list[str]:
+              if value is None:
+                  return []
+              if isinstance(value, list):
+                  out: list[str] = []
+                  for item in value:
+                      out.extend(segment_units(item))
+                  return out
+              if isinstance(value, dict):
+                  for key in ("phonemes", "phones", "units", "tokens", "value", "text"):
+                      if key in value:
+                          return segment_units(value[key])
+                  return []
+              text = str(value).strip()
+              if not text:
+                  return []
+              if any(ch.isspace() for ch in text):
+                  parts = [part for part in re.split(r"\s+", text) if part]
+                  if len(parts) > 1:
+                      out: list[str] = []
+                      for part in parts:
+                          out.extend(segment_units(part))
+                      return out
+              units: list[str] = []
+              pos = 0
+              while pos < len(text):
+                  matched = next((token for token in greedy_tokens if text.startswith(token, pos)), None)
+                  if matched is None:
+                      # Preserve an unknown code point rather than silently dropping it.
+                      units.append(text[pos])
+                      pos += 1
+                  else:
+                      units.append(matched)
+                      pos += len(matched)
+              return units
+
+          SURAH_KEYS = ("surah", "sura", "surah_number", "sura_number", "chapter", "chapter_number")
+          AYAH_KEYS = ("ayah", "aya", "ayah_number", "aya_number", "verse", "verse_number")
+          TEXT_KEYS = ("text", "ayah_text", "aya_text", "uthmani", "quran_text", "verse_text")
+          WORD_FIELDS = (
+              "phoneme_words", "phonemes_by_word", "word_phonemes", "words_phonemes",
+              "phonemeWords", "wordPhones", "words",
+          )
+
+          def scalar_int(obj: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+              for key in keys:
+                  value = obj.get(key)
+                  if isinstance(value, int):
+                      return value
+                  if isinstance(value, str) and value.strip().isdigit():
+                      return int(value.strip())
+              return None
+
+          def text_value(obj: dict[str, Any]) -> str:
+              for key in TEXT_KEYS:
+                  value = obj.get(key)
+                  if isinstance(value, str) and value.strip():
+                      return value.strip()
+              return ""
+
+          def word_data(obj: dict[str, Any]) -> Any:
+              for key in WORD_FIELDS:
+                  if key in obj:
+                      return obj[key]
+              return None
+
+          def flatten_candidates(node: Any, path: tuple[str, ...] = ()):
+              if isinstance(node, list):
+                  for index, item in enumerate(node):
+                      yield from flatten_candidates(item, path + (str(index),))
+                  return
+              if not isinstance(node, dict):
+                  return
+              has_content = bool(text_value(node) or word_data(node) is not None)
+              if has_content:
+                  yield path, node
+              for key, value in node.items():
+                  if isinstance(value, (dict, list)):
+                      yield from flatten_candidates(value, path + (str(key),))
+
+          def path_numbers(path: tuple[str, ...]) -> tuple[int | None, int | None]:
+              nums = [int(part) for part in path if part.isdigit()]
+              # Nested maps usually use 1-based surah and ayah. Array indexes are handled by explicit fields.
+              if len(nums) >= 2 and 1 <= nums[-2] <= 114 and nums[-1] >= 1:
+                  return nums[-2], nums[-1]
+              return None, None
+
+          def normalize_word_items(raw: Any, fallback_words: list[str]) -> list[dict[str, Any]]:
+              items: list[Any]
+              if isinstance(raw, dict):
+                  # Preserve insertion order. Some files map the visible word to its phonemes.
+                  items = [{"text": key, "phonemes": value} for key, value in raw.items()]
+              elif isinstance(raw, list):
+                  items = raw
+              else:
+                  return []
+
+              result: list[dict[str, Any]] = []
+              for index, item in enumerate(items):
+                  visible = fallback_words[index] if index < len(fallback_words) else ""
+                  phones: Any = item
+                  if isinstance(item, dict):
+                      visible = str(item.get("word") or item.get("text") or item.get("arabic") or visible)
+                      phones = (
+                          item.get("phonemes") if "phonemes" in item else
+                          item.get("phones") if "phones" in item else
+                          item.get("units") if "units" in item else
+                          item.get("tokens") if "tokens" in item else
+                          item.get("value")
+                      )
+                  units = segment_units(phones)
+                  if units:
+                      result.append({"text": visible, "phonemes": units})
+              return result
+
+          ayahs: dict[str, Any] = {}
+          rejected_samples: list[Any] = []
+          for path, entry in flatten_candidates(ordered):
+              surah = scalar_int(entry, SURAH_KEYS)
+              ayah = scalar_int(entry, AYAH_KEYS)
+              if surah is None or ayah is None:
+                  p_surah, p_ayah = path_numbers(path)
+                  surah = surah or p_surah
+                  ayah = ayah or p_ayah
+              if not surah or not ayah or not (1 <= surah <= 114):
+                  continue
+
+              text = text_value(entry)
+              fallback_words = [word for word in arabic_word_re.findall(text) if arabic_base_re.search(word)]
+              raw_words = word_data(entry)
+              words = normalize_word_items(raw_words, fallback_words)
+
+              # A few possible layouts store full ayah phonemes plus explicit word objects elsewhere.
+              if not words and isinstance(entry.get("phonemes"), list) and fallback_words:
+                  maybe = entry["phonemes"]
+                  if len(maybe) == len(fallback_words):
+                      words = normalize_word_items(maybe, fallback_words)
+
+              if not words:
+                  if len(rejected_samples) < 3:
+                      rejected_samples.append({"path": path, "keys": list(entry.keys()), "text": text[:80]})
+                  continue
+
+              if fallback_words and len(words) != len(fallback_words):
+                  # Refuse approximate word boundaries: wrong boundaries would produce misleading red words.
+                  if len(rejected_samples) < 3:
+                      rejected_samples.append({
+                          "path": path,
+                          "reason": "word_count_mismatch",
+                          "expected": len(fallback_words),
+                          "phoneme_words": len(words),
+                          "keys": list(entry.keys()),
+                      })
+                  continue
+
+              ayahs[f"{surah}:{ayah}"] = {
+                  "surah": surah,
+                  "ayah": ayah,
+                  "text": text,
+                  "words": words,
+              }
+
+          # Fallback for a layout that is an ordered list with explicit metadata hidden in each item.
+          if len(ayahs) < 6000:
+              print(f"Parsed only {len(ayahs)} ayahs. Samples that were not accepted:")
+              print(json.dumps(rejected_samples, ensure_ascii=False, indent=2))
+              raise RuntimeError(
+                  "Could not produce reliable word-level phoneme boundaries for at least 6000 ayahs. "
+                  "The workflow deliberately stops rather than publishing misleading word colors."
+              )
+
+          with (OUT / "quran-word-phonemes.json").open("w", encoding="utf-8") as handle:
+              json.dump(
+                  {"version": 1, "source": "Muno459/zipformer_p-quran", "ayahs": ayahs},
+                  handle,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              )
+
+          # Preserve the source tables and license for auditability and the non-commercial terms.
+          for filename in ("phoneme_units.json", "quran_text2phoneme.json", "ordered_quran_phonemes.json", "LICENSE", "README.md"):
+              target_name = "MODEL_LICENSE.txt" if filename == "LICENSE" else filename
+              (OUT / target_name).write_bytes((ROOT / filename).read_bytes())
+
+          print(f"Prepared {len(ayahs)} ayahs, {len(vocab)} phoneme units, blank id {blank_id}")
+          PY
+          python /tmp/prepare_quran_assets.py
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: '4.0.23'
+          actions-cache-folder: emsdk-cache
+
+      - name: Build sherpa-onnx WebAssembly streaming runtime
+        run: |
+          git clone --depth 1 --branch v1.13.2 https://github.com/k2-fsa/sherpa-onnx.git sherpa-onnx
+          cp downloaded-model/quran_phoneme_zipformer.int8.onnx sherpa-onnx/wasm/asr/assets/encoder.onnx
+          cp prepared-assets/tokens.txt sherpa-onnx/wasm/asr/assets/tokens.txt
+
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("sherpa-onnx/wasm/asr/sherpa-onnx-asr.js")
+          text = path.read_text(encoding="utf-8")
+          old = "let type = 0;"
+          if old not in text:
+              raise RuntimeError("Could not locate the sherpa model type selector")
+          path.write_text(text.replace(old, "let type = 2;", 1), encoding="utf-8")
+          PY
+
+          cd sherpa-onnx
+          ./build-wasm-simd-asr.sh
+          cd ..
+
+      - name: Assemble browser runtime
+        run: |
+          mkdir -p site/streaming
+          OUT_DIR="sherpa-onnx/build-wasm-simd-asr/install/bin/wasm/asr"
+          cp "$OUT_DIR"/* site/streaming/
+          cp prepared-assets/quran-word-phonemes.json site/streaming/
+          cp prepared-assets/phoneme-vocabulary.json site/streaming/
+          cp prepared-assets/MODEL_LICENSE.txt site/streaming/
+          cp prepared-assets/README.md site/streaming/MODEL_README.md
+
+          cat > site/streaming/quran-streaming-host.js <<'JS'
+          (() => {
+            'use strict'
+
+            let moduleRef = null
+            let recognizer = null
+            let stream = null
+            let ready = false
+            let lastText = ''
+            let canonicalPromise = null
+            let vocabularyPromise = null
+
+            const reply = (event, payload, transfer = []) => {
+              if (!event.source || typeof event.source.postMessage !== 'function') return
+              event.source.postMessage({ ...payload, __quranStreaming: true }, event.origin || '*', transfer)
+            }
+
+            const loadJson = async (name) => {
+              const response = await fetch(new URL(name, location.href), { cache: 'force-cache' })
+              if (!response.ok) throw new Error(`Failed to load ${name}: ${response.status}`)
+              return response.json()
+            }
+
+            const getCanonicalStore = () => {
+              canonicalPromise ||= loadJson('quran-word-phonemes.json')
+              return canonicalPromise
+            }
+
+            const getVocabularyStore = () => {
+              vocabularyPromise ||= loadJson('phoneme-vocabulary.json')
+              return vocabularyPromise
+            }
+
+            const recognizerConfig = () => ({
+              featConfig: { sampleRate: 16000, featureDim: 80 },
+              modelConfig: {
+                transducer: { encoder: '', decoder: '', joiner: '' },
+                paraformer: { encoder: '', decoder: '' },
+                zipformer2Ctc: { model: './encoder.onnx' },
+                nemoCtc: { model: '' },
+                toneCtc: { model: '' },
+                tokens: './tokens.txt',
+                numThreads: 1,
+                provider: 'cpu',
+                debug: 0,
+                modelType: 'zipformer2',
+                modelingUnit: 'cjkchar',
+                bpeVocab: '',
+              },
+              decodingMethod: 'greedy_search',
+              maxActivePaths: 4,
+              enableEndpoint: 0,
+              rule1MinTrailingSilence: 2.4,
+              rule2MinTrailingSilence: 1.2,
+              rule3MinUtteranceLength: 20,
+              hotwordsFile: '',
+              hotwordsScore: 1.5,
+              ctcFstDecoderConfig: { graph: '', maxActive: 3000 },
+              ruleFsts: '',
+              ruleFars: '',
+            })
+
+            const ensureStream = () => {
+              if (!ready || !recognizer) throw new Error('Streaming model is not ready')
+              if (!stream) stream = recognizer.createStream()
+              return stream
+            }
+
+            const normalizeResult = (result) => ({
+              text: typeof result?.text === 'string' ? result.text : '',
+              tokens: Array.isArray(result?.tokens) ? result.tokens.map(String) : [],
+              timestamps: Array.isArray(result?.timestamps) ? result.timestamps : [],
+            })
+
+            const decodeAvailable = (targetStream) => {
+              let loops = 0
+              while (recognizer.isReady(targetStream) && loops < 80) {
+                recognizer.decode(targetStream)
+                loops += 1
+              }
+              return normalizeResult(recognizer.getResult(targetStream))
+            }
+
+            const emitPartial = (event, result, final = false) => {
+              const signature = `${result.text}\u0000${result.tokens.join('\u0001')}`
+              if (!final && signature === lastText) return
+              lastText = signature
+              reply(event, {
+                type: final ? 'quran-streaming-final' : 'quran-streaming-partial',
+                result,
+              })
+            }
+
+            const resetStream = () => {
+              if (stream) {
+                try { stream.free() } catch (_) { /* no-op */ }
+              }
+              stream = recognizer?.createStream() || null
+              lastText = ''
+            }
+
+            window.QuranStreamingHost = {
+              onRuntimeReady(Module) {
+                try {
+                  moduleRef = Module
+                  recognizer = createOnlineRecognizer(moduleRef, recognizerConfig())
+                  ready = true
+                  window.parent?.postMessage({ type: 'quran-streaming-ready', __quranStreaming: true }, '*')
+                } catch (error) {
+                  console.error(error)
+                  window.parent?.postMessage({
+                    type: 'quran-streaming-error',
+                    __quranStreaming: true,
+                    message: error instanceof Error ? error.message : String(error),
+                  }, '*')
+                }
+              },
+            }
+
+            window.addEventListener('message', async (event) => {
+              const message = event.data
+              if (!message || message.__quranStreamingClient !== true) return
+              const requestId = message.requestId
+              try {
+                switch (message.type) {
+                  case 'ping':
+                    reply(event, { type: 'response', requestId, ok: true, value: { ready } })
+                    break
+                  case 'start':
+                    resetStream()
+                    reply(event, { type: 'response', requestId, ok: true, value: true })
+                    break
+                  case 'audio': {
+                    const targetStream = ensureStream()
+                    const samples = message.samples instanceof Float32Array
+                      ? message.samples
+                      : new Float32Array(message.samples)
+                    targetStream.acceptWaveform(16000, samples)
+                    const result = decodeAvailable(targetStream)
+                    emitPartial(event, result, false)
+                    break
+                  }
+                  case 'finish': {
+                    const targetStream = ensureStream()
+                    // A small zero tail lets the streaming graph flush its final chunk.
+                    targetStream.acceptWaveform(16000, new Float32Array(8000))
+                    targetStream.inputFinished()
+                    const result = decodeAvailable(targetStream)
+                    emitPartial(event, result, true)
+                    reply(event, { type: 'response', requestId, ok: true, value: result })
+                    break
+                  }
+                  case 'reset':
+                    resetStream()
+                    reply(event, { type: 'response', requestId, ok: true, value: true })
+                    break
+                  case 'canonical': {
+                    const store = await getCanonicalStore()
+                    const key = `${Number(message.surah)}:${Number(message.ayah)}`
+                    const value = store?.ayahs?.[key] || null
+                    if (!value) throw new Error(`Canonical phonemes not found for ${key}`)
+                    reply(event, { type: 'response', requestId, ok: true, value })
+                    break
+                  }
+                  case 'vocabulary': {
+                    const value = await getVocabularyStore()
+                    reply(event, { type: 'response', requestId, ok: true, value })
+                    break
+                  }
+                  default:
+                    throw new Error(`Unknown streaming request: ${message.type}`)
+                }
+              } catch (error) {
+                reply(event, {
+                  type: 'response',
+                  requestId,
+                  ok: false,
+                  error: error instanceof Error ? error.message : String(error),
+                })
+              }
+            })
+          })()
+          JS
+
+          python - <<'PY'
+          from pathlib import Path
+          import glob
+
+          root = Path("site/streaming")
+          wrappers = [p for p in root.glob("*.js") if p.name in {"sherpa-onnx.js", "sherpa-onnx-asr.js"}]
+          mains = [p for p in root.glob("*.js") if "wasm" in p.name and "main" in p.name]
+          if not wrappers or not mains:
+              raise RuntimeError(f"Could not locate sherpa browser scripts. Found: {[p.name for p in root.glob('*')]}")
+          wrapper = wrappers[0].name
+          main = mains[0].name
+          html = f'''<!doctype html>
+          <html lang="ar" dir="rtl">
+          <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <title>Quran Streaming Recognizer</title>
+          </head>
+          <body>
+            <p id="status">جارٍ تجهيز نموذج التسميع اللحظي…</p>
+            <script src="./quran-streaming-host.js"></script>
+            <script src="./{wrapper}"></script>
+            <script>
+              var Module = {{
+                locateFile: function(path) {{ return new URL(path, location.href).href; }},
+                onRuntimeInitialized: function() {{
+                  document.getElementById('status').textContent = 'النموذج جاهز';
+                  window.QuranStreamingHost.onRuntimeReady(Module);
+                }},
+                print: function(text) {{ console.log(text); }},
+                printErr: function(text) {{ console.error(text); }}
+              }};
+            </script>
+            <script src="./{main}"></script>
+          </body>
+          </html>'''
+          (root / "index.html").write_text(html, encoding="utf-8")
+          (root / "runtime-manifest.json").write_text(
+              '{"version":1,"engine":"sherpa-onnx","model":"Muno459/zipformer_p-quran-int8","mode":"streaming-phoneme-ctc"}',
+              encoding="utf-8",
+          )
+          PY
 
           cat > site/index.html <<'HTML'
-          <!doctype html>
-          <html lang="ar" dir="rtl">
-            <head><meta charset="utf-8"><title>Quran School Models</title></head>
-            <body><h1>Quran School Models</h1><p>Static model files for the Quran school application.</p></body>
-          </html>
+          <!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><title>Quran School Models</title><body><h1>نماذج مدرسة القرآن</h1><p><a href="./streaming/">فتح محرك التسميع اللحظي</a></p><p>الاستخدام مجاني وغير تجاري فقط وفق ترخيص النموذج المنشور داخل المجلد.</p></body></html>
           HTML
 
-          cat > "${TARGET}/MODEL_NOTICE.txt" <<'TXT'
-          Model: eventhorizon0/tarteel-ai-onnx-whisper-base-ar-quran
-          Source model: tarteel-ai/whisper-base-ar-quran
-          License: Apache-2.0
-          Hosted only to allow the Quran school browser application to download the open model reliably.
-          TXT
-
-          touch site/.nojekyll
-          find site -type f -print0 | sort -z | xargs -0 sha256sum > site/SHA256SUMS.txt
           du -sh site
+          find site/streaming -maxdepth 1 -type f -printf '%f %k KB\n' | sort
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
