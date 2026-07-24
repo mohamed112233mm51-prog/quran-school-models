@@ -29,8 +29,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Hugging Face downloader
-        run: python -m pip install --upgrade huggingface_hub
+      - name: Install model and Quran phonetic tooling
+        run: |
+          python -m pip install --upgrade huggingface_hub
+          python -m pip install "git+https://github.com/obadx/quran-transcript.git@main"
 
       - name: Verify HF token exists
         env:
@@ -53,6 +55,7 @@ jobs:
           files = [
               "quran_phoneme_zipformer.int8.onnx",
               "phoneme_units.json",
+              "tokens.txt",
               "quran_text2phoneme.json",
               "ordered_quran_phonemes.json",
               "LICENSE",
@@ -70,278 +73,234 @@ jobs:
               print(path, flush=True)
           PY
 
-      - name: Generate sherpa tokens and normalized word-level Quran data
+      - name: Generate sherpa tokens and reliable word-level Quran data
         run: |
           cat > /tmp/prepare_quran_assets.py <<'PY'
           import json
           import re
+          import shutil
           from pathlib import Path
           from typing import Any
+
+          from quran_transcript import Aya, MoshafAttributes, quran_phonetizer
 
           ROOT = Path("downloaded-model")
           OUT = Path("prepared-assets")
           OUT.mkdir(parents=True, exist_ok=True)
 
-          def load_json(name: str) -> Any:
-              with (ROOT / name).open("r", encoding="utf-8") as handle:
-                  return json.load(handle)
-
-          def token_map(data: Any) -> dict[str, int]:
-              candidates = data
-              if isinstance(data, dict):
-                  for key in ("token_to_id", "piece_to_id", "vocab", "units", "pieces", "tokens"):
-                      if key in data:
-                          candidates = data[key]
-                          break
-
+          def read_tokens(path: Path) -> dict[str, int]:
               result: dict[str, int] = {}
-              if isinstance(candidates, list):
-                  for index, item in enumerate(candidates):
-                      if isinstance(item, str):
-                          result[item] = index
-                      elif isinstance(item, dict):
-                          token = item.get("token") or item.get("piece") or item.get("unit") or item.get("text")
-                          token_id = item.get("id", index)
-                          if token is not None:
-                              result[str(token)] = int(token_id)
-              elif isinstance(candidates, dict):
-                  for key, value in candidates.items():
-                      if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
-                          result[str(key)] = int(value)
-                      elif (isinstance(key, str) and key.isdigit()) and isinstance(value, str):
-                          result[value] = int(key)
-                      elif isinstance(value, dict):
-                          token = value.get("token") or value.get("piece") or value.get("unit") or value.get("text") or key
-                          token_id = value.get("id")
-                          if token_id is not None:
-                              result[str(token)] = int(token_id)
-
+              for raw_line in path.read_text(encoding="utf-8").splitlines():
+                  line = raw_line.strip()
+                  if not line:
+                      continue
+                  token, token_id = line.rsplit(maxsplit=1)
+                  result[token] = int(token_id)
               if not result:
-                  raise RuntimeError("Could not understand phoneme_units.json structure")
-              ids = sorted(result.values())
-              if len(ids) != len(set(ids)):
-                  raise RuntimeError("Duplicate ids found in phoneme_units.json")
+                  raise RuntimeError("tokens.txt is empty")
+              if len(result.values()) != len(set(result.values())):
+                  raise RuntimeError("Duplicate ids found in tokens.txt")
               return result
 
-          vocab = token_map(load_json("phoneme_units.json"))
-          blank_id = max(vocab.values()) + 1
-          with (OUT / "tokens.txt").open("w", encoding="utf-8") as handle:
-              for token, token_id in sorted(vocab.items(), key=lambda item: item[1]):
-                  display = token if token else "<eps>"
-                  handle.write(f"{display} {token_id}\n")
-              handle.write(f"<blk> {blank_id}\n")
+          vocab = read_tokens(ROOT / "tokens.txt")
+          blank_id = vocab.get("<blk>", max(vocab.values()))
+          shutil.copy2(ROOT / "tokens.txt", OUT / "tokens.txt")
 
-          # Stable vocabulary file for the browser-side greedy segmenter.
+          special_tokens = {"<blk>", "<eps>", "<unk>", "<s>", "</s>", "<pad>"}
+          greedy_tokens = sorted(
+              [
+                  token
+                  for token in vocab
+                  if token
+                  and token not in special_tokens
+                  and not (token.startswith("<") and token.endswith(">"))
+              ],
+              key=len,
+              reverse=True,
+          )
+
           with (OUT / "phoneme-vocabulary.json").open("w", encoding="utf-8") as handle:
               json.dump(
                   {
-                      "version": 1,
+                      "version": 2,
                       "blank_id": blank_id,
-                      "tokens": [token for token, _ in sorted(vocab.items(), key=lambda item: item[1])],
+                      "tokens": [
+                          token
+                          for token, _ in sorted(vocab.items(), key=lambda item: item[1])
+                          if token != "<blk>"
+                      ],
                   },
                   handle,
                   ensure_ascii=False,
                   separators=(",", ":"),
               )
 
-          ordered = load_json("ordered_quran_phonemes.json")
-          text_to_phoneme = load_json("quran_text2phoneme.json")
-          arabic_word_re = re.compile(r"[\u0621-\u063A\u0641-\u064A\u0671\u064B-\u065F\u0670\u06D6-\u06ED]+")
-          arabic_base_re = re.compile(r"[\u0621-\u063A\u0641-\u064A\u0671]")
-          special_tokens = {"<blk>", "<eps>", "<unk>", "<s>", "</s>", "<pad>"}
-          greedy_tokens = sorted(
-              [t for t in vocab if t and t not in special_tokens and not (t.startswith("<") and t.endswith(">"))],
-              key=len,
-              reverse=True,
-          )
-
-          def segment_units(value: Any) -> list[str]:
-              if value is None:
-                  return []
-              if isinstance(value, list):
-                  out: list[str] = []
-                  for item in value:
-                      out.extend(segment_units(item))
-                  return out
-              if isinstance(value, dict):
-                  for key in ("phonemes", "phones", "units", "tokens", "value", "text"):
-                      if key in value:
-                          return segment_units(value[key])
-                  return []
-              text = str(value).strip()
+          def segment_units(text: str, context: str) -> list[str]:
+              text = text.strip()
               if not text:
                   return []
-              if any(ch.isspace() for ch in text):
-                  parts = [part for part in re.split(r"\s+", text) if part]
-                  if len(parts) > 1:
-                      out: list[str] = []
-                      for part in parts:
-                          out.extend(segment_units(part))
-                      return out
               units: list[str] = []
               pos = 0
               while pos < len(text):
                   matched = next((token for token in greedy_tokens if text.startswith(token, pos)), None)
                   if matched is None:
-                      # Preserve an unknown code point rather than silently dropping it.
-                      units.append(text[pos])
-                      pos += 1
-                  else:
-                      units.append(matched)
-                      pos += len(matched)
+                      codepoint = f"U+{ord(text[pos]):04X}"
+                      raise RuntimeError(
+                          f"Unknown phoneme {text[pos]!r} ({codepoint}) in {context} at position {pos}"
+                      )
+                  units.append(matched)
+                  pos += len(matched)
               return units
 
-          SURAH_KEYS = ("surah", "sura", "surah_number", "sura_number", "chapter", "chapter_number")
-          AYAH_KEYS = ("ayah", "aya", "ayah_number", "aya_number", "verse", "verse_number")
-          TEXT_KEYS = ("text", "ayah_text", "aya_text", "uthmani", "quran_text", "verse_text")
-          WORD_FIELDS = (
-              "phoneme_words", "phonemes_by_word", "word_phonemes", "words_phonemes",
-              "phonemeWords", "wordPhones", "words",
+          def mapping_span(mapping: Any) -> tuple[int, int] | None:
+              if mapping is None or bool(getattr(mapping, "deleted", False)):
+                  return None
+              pos = getattr(mapping, "pos", None)
+              if not pos or len(pos) != 2:
+                  return None
+              start, end = int(pos[0]), int(pos[1])
+              if end <= start:
+                  return None
+              return start, end
+
+          def find_word_char_spans(text: str, words: list[str]) -> list[tuple[int, int]]:
+              spans: list[tuple[int, int]] = []
+              cursor = 0
+              for word in words:
+                  start = text.find(word, cursor)
+                  if start < 0:
+                      raise RuntimeError(f"Could not locate word {word!r} inside ayah text {text!r}")
+                  end = start + len(word)
+                  spans.append((start, end))
+                  cursor = end
+              return spans
+
+          moshaf = MoshafAttributes(
+              rewaya="hafs",
+              madd_monfasel_len=4,
+              madd_mottasel_len=4,
+              madd_mottasel_waqf=4,
+              madd_aared_len=4,
           )
 
-          def scalar_int(obj: dict[str, Any], keys: tuple[str, ...]) -> int | None:
-              for key in keys:
-                  value = obj.get(key)
-                  if isinstance(value, int):
-                      return value
-                  if isinstance(value, str) and value.strip().isdigit():
-                      return int(value.strip())
-              return None
-
-          def text_value(obj: dict[str, Any]) -> str:
-              for key in TEXT_KEYS:
-                  value = obj.get(key)
-                  if isinstance(value, str) and value.strip():
-                      return value.strip()
-              return ""
-
-          def word_data(obj: dict[str, Any]) -> Any:
-              for key in WORD_FIELDS:
-                  if key in obj:
-                      return obj[key]
-              return None
-
-          def flatten_candidates(node: Any, path: tuple[str, ...] = ()):
-              if isinstance(node, list):
-                  for index, item in enumerate(node):
-                      yield from flatten_candidates(item, path + (str(index),))
-                  return
-              if not isinstance(node, dict):
-                  return
-              has_content = bool(text_value(node) or word_data(node) is not None)
-              if has_content:
-                  yield path, node
-              for key, value in node.items():
-                  if isinstance(value, (dict, list)):
-                      yield from flatten_candidates(value, path + (str(key),))
-
-          def path_numbers(path: tuple[str, ...]) -> tuple[int | None, int | None]:
-              nums = [int(part) for part in path if part.isdigit()]
-              # Nested maps usually use 1-based surah and ayah. Array indexes are handled by explicit fields.
-              if len(nums) >= 2 and 1 <= nums[-2] <= 114 and nums[-1] >= 1:
-                  return nums[-2], nums[-1]
-              return None, None
-
-          def normalize_word_items(raw: Any, fallback_words: list[str]) -> list[dict[str, Any]]:
-              items: list[Any]
-              if isinstance(raw, dict):
-                  # Preserve insertion order. Some files map the visible word to its phonemes.
-                  items = [{"text": key, "phonemes": value} for key, value in raw.items()]
-              elif isinstance(raw, list):
-                  items = raw
-              else:
-                  return []
-
-              result: list[dict[str, Any]] = []
-              for index, item in enumerate(items):
-                  visible = fallback_words[index] if index < len(fallback_words) else ""
-                  phones: Any = item
-                  if isinstance(item, dict):
-                      visible = str(item.get("word") or item.get("text") or item.get("arabic") or visible)
-                      phones = (
-                          item.get("phonemes") if "phonemes" in item else
-                          item.get("phones") if "phones" in item else
-                          item.get("units") if "units" in item else
-                          item.get("tokens") if "tokens" in item else
-                          item.get("value")
-                      )
-                  units = segment_units(phones)
-                  if units:
-                      result.append({"text": visible, "phonemes": units})
-              return result
-
           ayahs: dict[str, Any] = {}
-          rejected_samples: list[Any] = []
-          for path, entry in flatten_candidates(ordered):
-              surah = scalar_int(entry, SURAH_KEYS)
-              ayah = scalar_int(entry, AYAH_KEYS)
-              if surah is None or ayah is None:
-                  p_surah, p_ayah = path_numbers(path)
-                  surah = surah or p_surah
-                  ayah = ayah or p_ayah
-              if not surah or not ayah or not (1 <= surah <= 114):
-                  continue
+          failures: list[str] = []
 
-              text = text_value(entry)
-              fallback_words = [word for word in arabic_word_re.findall(text) if arabic_base_re.search(word)]
-              raw_words = word_data(entry)
-              words = normalize_word_items(raw_words, fallback_words)
+          quran_cursor = Aya(1, 1)
+          for surah in range(1, 115):
+              quran_cursor.set(surah, 1)
+              first_info = quran_cursor.get()
+              count = int(first_info.num_ayat_in_sura)
 
-              # A few possible layouts store full ayah phonemes plus explicit word objects elsewhere.
-              if not words and isinstance(entry.get("phonemes"), list) and fallback_words:
-                  maybe = entry["phonemes"]
-                  if len(maybe) == len(fallback_words):
-                      words = normalize_word_items(maybe, fallback_words)
+              for ayah in range(1, count + 1):
+                  key = f"{surah}:{ayah}"
+                  try:
+                      quran_cursor.set(surah, ayah)
+                      info = quran_cursor.get()
+                      text = str(info.uthmani).strip()
+                      words = [str(word) for word in info.uthmani_words if str(word).strip()]
+                      if not text or not words:
+                          raise RuntimeError("Empty Uthmani text or word list")
 
-              if not words:
-                  if len(rejected_samples) < 3:
-                      rejected_samples.append({"path": path, "keys": list(entry.keys()), "text": text[:80]})
-                  continue
+                      # Generate the full ayah in connected-recitation mode. Removing spaces keeps
+                      # the canonical reference in the same compact phoneme stream used by the CTC model.
+                      phonetic = quran_phonetizer(text, moshaf, remove_spaces=True)
+                      phoneme_text = str(phonetic.phonemes)
+                      mappings = list(phonetic.mappings)
+                      if len(mappings) != len(text):
+                          raise RuntimeError(
+                              f"Mapping length mismatch: text={len(text)}, mappings={len(mappings)}"
+                          )
 
-              if fallback_words and len(words) != len(fallback_words):
-                  # Refuse approximate word boundaries: wrong boundaries would produce misleading red words.
-                  if len(rejected_samples) < 3:
-                      rejected_samples.append({
-                          "path": path,
-                          "reason": "word_count_mismatch",
-                          "expected": len(fallback_words),
-                          "phoneme_words": len(words),
-                          "keys": list(entry.keys()),
-                      })
-                  continue
+                      char_spans = find_word_char_spans(text, words)
+                      starts: list[int] = []
+                      for word_index, (char_start, char_end) in enumerate(char_spans):
+                          mapped = [
+                              span
+                              for span in (mapping_span(mappings[index]) for index in range(char_start, char_end))
+                              if span is not None
+                          ]
+                          if not mapped:
+                              raise RuntimeError(f"Word {word_index + 1} has no mapped phonemes")
+                          starts.append(min(span[0] for span in mapped))
 
-              ayahs[f"{surah}:{ayah}"] = {
-                  "surah": surah,
-                  "ayah": ayah,
-                  "text": text,
-                  "words": words,
-              }
+                      # The first word owns any leading context; inter-word transformed sounds are
+                      # assigned up to the next word's mapped start. This covers the full stream once.
+                      starts[0] = 0
+                      if any(starts[index] >= starts[index + 1] for index in range(len(starts) - 1)):
+                          raise RuntimeError(f"Non-increasing phoneme starts: {starts}")
 
-          # Fallback for a layout that is an ordered list with explicit metadata hidden in each item.
-          if len(ayahs) < 6000:
-              print(f"Parsed only {len(ayahs)} ayahs. Samples that were not accepted:")
-              print(json.dumps(rejected_samples, ensure_ascii=False, indent=2))
+                      word_rows: list[dict[str, Any]] = []
+                      concatenated: list[str] = []
+                      for index, word in enumerate(words):
+                          ph_start = starts[index]
+                          ph_end = starts[index + 1] if index + 1 < len(starts) else len(phoneme_text)
+                          if ph_end <= ph_start:
+                              raise RuntimeError(f"Empty phoneme span for word {index + 1}")
+                          units = segment_units(phoneme_text[ph_start:ph_end], f"ayah {key}, word {index + 1}")
+                          if not units:
+                              raise RuntimeError(f"No units for word {index + 1}")
+                          word_rows.append({
+                              "text": word,
+                              "phonemes": units,
+                              "phoneme_start": ph_start,
+                              "phoneme_end": ph_end,
+                          })
+                          concatenated.extend(units)
+
+                      full_units = segment_units(phoneme_text, f"ayah {key}")
+                      if concatenated != full_units:
+                          raise RuntimeError("Word spans do not reproduce the full canonical phoneme stream")
+
+                      ayahs[key] = {
+                          "surah": surah,
+                          "ayah": ayah,
+                          "text": text,
+                          "phonemes": full_units,
+                          "words": word_rows,
+                      }
+                  except Exception as error:
+                      if len(failures) < 20:
+                          failures.append(f"{key}: {error}")
+
+          if failures:
+              print("First generation failures:")
+              print("\n".join(failures))
+
+          if len(ayahs) != 6236:
               raise RuntimeError(
-                  "Could not produce reliable word-level phoneme boundaries for at least 6000 ayahs. "
-                  "The workflow deliberately stops rather than publishing misleading word colors."
+                  f"Generated {len(ayahs)} of 6236 ayahs. "
+                  "The workflow stops rather than publishing unreliable word colors."
               )
 
           with (OUT / "quran-word-phonemes.json").open("w", encoding="utf-8") as handle:
               json.dump(
-                  {"version": 1, "source": "Muno459/zipformer_p-quran", "ayahs": ayahs},
+                  {
+                      "version": 2,
+                      "source": "obadx/quran-transcript + Muno459/zipformer_p-quran",
+                      "moshaf": {
+                          "rewaya": "hafs",
+                          "madd_monfasel_len": 4,
+                          "madd_mottasel_len": 4,
+                          "madd_mottasel_waqf": 4,
+                          "madd_aared_len": 4,
+                      },
+                      "ayahs": ayahs,
+                  },
                   handle,
                   ensure_ascii=False,
                   separators=(",", ":"),
               )
 
-          # Preserve the source tables and license for auditability and the non-commercial terms.
-          for filename in ("phoneme_units.json", "quran_text2phoneme.json", "ordered_quran_phonemes.json", "LICENSE", "README.md"):
+          for filename in ("LICENSE", "README.md"):
               target_name = "MODEL_LICENSE.txt" if filename == "LICENSE" else filename
-              (OUT / target_name).write_bytes((ROOT / filename).read_bytes())
+              shutil.copy2(ROOT / filename, OUT / target_name)
 
-          print(f"Prepared {len(ayahs)} ayahs, {len(vocab)} phoneme units, blank id {blank_id}")
+          print(f"Prepared all {len(ayahs)} ayahs with reliable word boundaries")
+          print(f"Vocabulary size: {len(vocab)}, blank id: {blank_id}")
           PY
           python /tmp/prepare_quran_assets.py
+
 
       - name: Set up Emscripten
         uses: mymindstorm/setup-emsdk@v14
